@@ -9,17 +9,25 @@ D3：从法律库「检索结果页」提取「人工智能」命中次数，并
 用法概览
 ---------
 目录约定（推荐）：data/d3_policies/<法律法规类|部门规章类|规范性文件类>/<省份>/*.html
-  每个省一个文件夹，不再按年份分子目录；同一 HTML 可含 2017–2023 多条结果，脚本按「公布年份」拆到各年。
+  每个省一个文件夹，不再按年份分子目录。同一 HTML 可含多条检索结果；脚本从每条结果中解析「公布/发布日期」得到发布年份，
+  将该条「人工智能」命中次数计入 (省, 年, 三大类) 后按年求和。若单条无法解析年份但文件名以「YYYY_」开头（迁移命名），
+  则用该年作为后备。年份上下限由 rebuild-hit-csv 的 --year-min / --year-max 控制（默认含 2017–2035，便于纳入新公布数据）。
 
 一键从 data 重算并写入 output/beijing_d3_hit_counts.csv：
 
    python -m src.d3_legal_hits rebuild-hit-csv
+
+   若汇总表只要 2017–2023 年：加参数 ``--year-max 2023``（默认上限为 2035，便于纳入新公布年份）。
 
 若仍有旧结构「省/年份/」页面，可先迁移到「省/」下（会重写资源目录名并更新 HTML 内引用）：
 
    python -m src.d3_legal_hits migrate-data-layout
 
 其它子命令：parse-html（单目录追加 jsonl）、aggregate（从 jsonl 汇总）、playwright（需配置）。
+
+多页结果（如广东条数多）：浏览器「另存为」只会保存当前屏，要全量需用 ``playwright`` 子命令在配置里填写
+``selectors.next_page``（北大法宝 V6 可参考 ``data/d3_scraper_config.example.json``），并实现 ``apply_search`` 填检索条件；
+脚本会逐页 ``page.content()`` 后走同一套解析逻辑。请务必遵守站点条款与 robots，控制频率。
 
 使用前请自行确认目标网站的 robots.txt 与用户协议，控制请求频率，避免对订阅库违规批量抓取。
 """
@@ -81,8 +89,24 @@ _HIT_PATTERNS: list[re.Pattern[str]] = [
 _YEAR_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"公布日期\s*[：:]\s*(\d{4})[./年]"),
     re.compile(r"发布日期\s*[：:]\s*(\d{4})[./年]"),
+    re.compile(r"公布时间\s*[：:]\s*(\d{4})[./年]"),
+    re.compile(r"发布时间\s*[：:]\s*(\d{4})[./年]"),
+    re.compile(r"成文日期\s*[：:]\s*(\d{4})[./年]"),
     re.compile(r"(\d{4})\s*[./年]\s*\d{1,2}\s*[./月]\s*\d{1,2}\s*日?\s*(?:公布|发布)"),
 ]
+
+# 迁移后的结果页命名：YYYY_省份_序号.html，单条缺省日期时用文件名年份归类
+_FILENAME_YEAR_PREFIX = re.compile(r"^(\d{4})_")
+
+
+def year_hint_from_filename(stem: str) -> int | None:
+    m = _FILENAME_YEAR_PREFIX.match(stem)
+    if not m:
+        return None
+    y = int(m.group(1))
+    if 1990 <= y <= 2100:
+        return y
+    return None
 
 
 def extract_hit_count(text: str) -> int:
@@ -135,6 +159,9 @@ def parse_result_page(
     effectiveness_label: str,
     item_selector: str | None = None,
     fixed_year: int | None = None,
+    year_min: int = 2017,
+    year_max: int = 2035,
+    filename_default_year: int | None = None,
 ) -> list[dict[str, Any]]:
     group = EFFECTIVENESS_TO_GROUP.get(effectiveness_label)
     if group is None:
@@ -145,8 +172,10 @@ def parse_result_page(
     rows: list[dict[str, Any]] = []
     for block in split_blocks_html(html, item_selector):
         year = extract_pub_year(block)
+        if year is None:
+            year = filename_default_year
         hits = extract_hit_count(block)
-        if year is None or not (2017 <= year <= 2023):
+        if year is None or not (year_min <= year <= year_max):
             continue
         if fixed_year is not None and year != fixed_year:
             continue
@@ -170,6 +199,8 @@ def cmd_parse_html(args: argparse.Namespace) -> int:
         raise SystemExit(f"不是目录: {d}")
     item_sel = args.item_selector or None
     all_rows: list[dict[str, Any]] = []
+    ym = int(args.year_min)
+    yM = int(args.year_max)
     for p in sorted(chain(d.glob("*.html"), d.glob("*.htm"))):
         html = p.read_text(encoding="utf-8", errors="replace")
         all_rows.extend(
@@ -179,6 +210,9 @@ def cmd_parse_html(args: argparse.Namespace) -> int:
                 effectiveness_label=args.effectiveness,
                 item_selector=item_sel,
                 fixed_year=args.fixed_year,
+                year_min=ym,
+                year_max=yM,
+                filename_default_year=year_hint_from_filename(p.stem),
             )
         )
     out_path = Path(args.append_jsonl)
@@ -318,8 +352,10 @@ def rebuild_hit_counts_csv(
     out_csv: Path,
     *,
     item_selector: str | None = None,
+    year_min: int = 2017,
+    year_max: int = 2035,
 ) -> int:
-    """扫描三类 × 各省下所有 html，按公布年份归入 2017–2023，汇总为省–年宽表。"""
+    """扫描三类 × 各省下所有 html，按每条结果的发布年份汇总「人工智能」命中，再按省–年–三类求和写出宽表。"""
     rows: list[dict[str, Any]] = []
     for type_name in POLICY_TYPE_DIRS:
         eff = FOLDER_TO_EFFECTIVENESS[type_name]
@@ -332,6 +368,7 @@ def rebuild_hit_counts_csv(
             province = prov_dir.name
             for hf in collect_html_paths_in_province(prov_dir):
                 html = hf.read_text(encoding="utf-8", errors="replace")
+                file_year = year_hint_from_filename(hf.stem)
                 rows.extend(
                     parse_result_page(
                         html,
@@ -339,6 +376,9 @@ def rebuild_hit_counts_csv(
                         effectiveness_label=eff,
                         item_selector=item_selector,
                         fixed_year=None,
+                        year_min=year_min,
+                        year_max=year_max,
+                        filename_default_year=file_year,
                     )
                 )
     sums: dict[tuple[str, int], dict[str, int]] = defaultdict(
@@ -372,7 +412,7 @@ def rebuild_hit_counts_csv(
                 ]
             )
     print(
-        f"rebuild-hit-csv: 解析 {len(rows)} 条法规级记录，"
+        f"rebuild-hit-csv: 解析 {len(rows)} 条结果级记录（按发布年汇总命中），"
         f"输出 {len(keys)} 行省–年 -> {out_csv}"
     )
     return 0
@@ -397,11 +437,30 @@ def cmd_rebuild_hit_csv(args: argparse.Namespace) -> int:
     if not out.is_absolute():
         out = Path(__file__).resolve().parents[1] / out
     isel = (args.item_selector or "").strip() or None
-    return rebuild_hit_counts_csv(root, out, item_selector=isel)
+    return rebuild_hit_counts_csv(
+        root,
+        out,
+        item_selector=isel,
+        year_min=int(args.year_min),
+        year_max=int(args.year_max),
+    )
 
 
 def _load_config(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _playwright_table_fingerprint(page: Any, item_sel: str | None) -> tuple[int, str]:
+    """用于判断是否真正翻到下一页（SPA 上 networkidle 不可靠）。"""
+    try:
+        row_loc = page.locator(item_sel or ".el-table__body .el-table__row")
+        n_rows = row_loc.count()
+        head = (
+            row_loc.first.inner_text(timeout=3000)[:240] if n_rows else ""
+        )
+        return (n_rows, head)
+    except Exception:
+        return (-1, "")
 
 
 def cmd_playwright(args: argparse.Namespace) -> int:
@@ -430,6 +489,9 @@ def cmd_playwright(args: argparse.Namespace) -> int:
     start_url = site.get("start_url") or ""
     if not start_url:
         raise SystemExit("配置中 site.start_url 不能为空")
+    pagination_wait_ms = int(site.get("pagination_wait_ms") or 1500)
+    pagination_wait = (site.get("pagination_wait") or "timeout").strip().lower()
+    max_result_pages = int(site.get("max_result_pages") or 500)
 
     search_cfg = cfg.get("search") or {}
     keyword = search_cfg.get("keyword") or "人工智能"
@@ -458,7 +520,15 @@ def cmd_playwright(args: argparse.Namespace) -> int:
             for eff in filters:
                 apply_search(page, prov, eff, keyword, d0, d1)
                 page.wait_for_timeout(2000)
+                page_num = 0
                 while True:
+                    page_num += 1
+                    if page_num > max_result_pages:
+                        print(
+                            f"警告: {prov} / {eff} 已超过 max_result_pages={max_result_pages}，"
+                            "停止翻页以防死循环；可在配置 site.max_result_pages 中调大。"
+                        )
+                        break
                     html = page.content()
                     rows = parse_result_page(
                         html,
@@ -474,8 +544,26 @@ def cmd_playwright(args: argparse.Namespace) -> int:
                     nxt = page.locator(next_sel).first
                     if not nxt.count() or not nxt.is_enabled():
                         break
+                    fp_before = _playwright_table_fingerprint(
+                        page, item_sel or None
+                    )
                     nxt.click()
-                    page.wait_for_load_state("networkidle")
+                    if pagination_wait == "networkidle":
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=20000)
+                        except Exception:
+                            page.wait_for_timeout(pagination_wait_ms)
+                    else:
+                        page.wait_for_timeout(pagination_wait_ms)
+                    fp_after = _playwright_table_fingerprint(
+                        page, item_sel or None
+                    )
+                    if fp_before == fp_after:
+                        print(
+                            f"提示: {prov} / {eff} 点击下一页后列表未变化，"
+                            f"停止翻页（已处理约 {page_num} 屏）。"
+                        )
+                        break
         browser.close()
 
     print(f"已追加写入 {out_jsonl}；请运行 aggregate 生成宽表。")
@@ -513,7 +601,7 @@ def main() -> int:
 
     p_reb = sub.add_parser(
         "rebuild-hit-csv",
-        help="扫描 data 下三类×各省全部 html，按公布年汇总并覆盖输出 CSV",
+        help="扫描 data 下三类×各省全部 html，按发布年汇总「人工智能」命中并覆盖输出 CSV",
     )
     p_reb.add_argument(
         "--data-root",
@@ -532,6 +620,18 @@ def main() -> int:
         "--item-selector",
         default="",
         help="可选：每条结果 CSS 选择器",
+    )
+    p_reb.add_argument(
+        "--year-min",
+        type=int,
+        default=2017,
+        help="纳入统计的最小发布年份（含），默认 2017",
+    )
+    p_reb.add_argument(
+        "--year-max",
+        type=int,
+        default=2035,
+        help="纳入统计的最大发布年份（含），默认 2035",
     )
     p_reb.set_defaults(func=cmd_rebuild_hit_csv)
 
@@ -559,6 +659,18 @@ def main() -> int:
         default=None,
         help="可选：仅统计该年份（建议与你检索页的发布年份一致，例如 2022）",
     )
+    p_parse.add_argument(
+        "--year-min",
+        type=int,
+        default=2017,
+        help="纳入统计的最小发布年份（含），默认 2017",
+    )
+    p_parse.add_argument(
+        "--year-max",
+        type=int,
+        default=2035,
+        help="纳入统计的最大发布年份（含），默认 2035",
+    )
     p_parse.set_defaults(func=cmd_parse_html)
 
     p_agg = sub.add_parser("aggregate", help="将 jsonl 汇总为省-年-三类命中宽表")
@@ -577,7 +689,7 @@ def main() -> int:
 
     p_pw = sub.add_parser(
         "playwright",
-        help="全自动（需配置 plugin + selectors；请先确认站点条款）",
+        help="全自动（plugin + selectors；selectors.next_page 非空时会逐页翻页解析）",
     )
     p_pw.add_argument(
         "--config",

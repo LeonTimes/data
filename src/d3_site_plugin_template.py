@@ -6,6 +6,10 @@
    制定机关/地域、公布日期、效力位阶、全文关键词等
 3. 不要在代码里硬编码账号密码；首次用有头浏览器登录后保存 storage_state
 
+多页结果：在 data/d3_scraper_config.json（可由 example 复制）的 selectors 中填写
+next_page（北大法宝 V6 见 example 里的默认值），playwright 子命令会在每页解析后自动点「下一页」
+直到按钮不可用或列表不再变化。另存为 HTML 无法包含未加载的后续页。
+
 函数签名（同步 Playwright）：
   def apply_search(page, province: str, effectiveness_label: str, keyword: str,
                    date_start: str, date_end: str) -> None

@@ -1,7 +1,10 @@
 {
   "site": {
     "start_url": "https://在此填写你的法律库高级检索页URL",
-    "navigation_timeout_ms": 90000
+    "navigation_timeout_ms": 90000,
+    "pagination_wait": "timeout",
+    "pagination_wait_ms": 1800,
+    "max_result_pages": 500
   },
   "search": {
     "keyword": "人工智能",
@@ -16,9 +19,8 @@
   ],
   "playwright_storage_state": "data/d3_browser_auth.json",
   "selectors": {
-    "result_item": "",
-    "next_page": "",
-    "disabled_class_or_attr": ""
+    "result_item": ".articalIndex-container .el-table__body tr.el-table__row",
+    "next_page": ".el-pagination button.btn-next:not([disabled])"
   },
   "plugin_module": "",
   "plugin_callable": "apply_search"
