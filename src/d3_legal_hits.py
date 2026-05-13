@@ -8,25 +8,18 @@ D3：从法律库「检索结果页」提取「人工智能」命中次数，并
 
 用法概览
 ---------
-1) 推荐（合规、可复现）：在浏览器中完成检索后，将「每一页结果」另存为 .html，
-   再批量解析：
+目录约定（推荐）：data/d3_policies/<法律法规类|部门规章类|规范性文件类>/<省份>/*.html
+  每个省一个文件夹，不再按年份分子目录；同一 HTML 可含 2017–2023 多条结果，脚本按「公布年份」拆到各年。
 
-   python -m src.d3_legal_hits parse-html \\
-     --html-dir path/to/上海/法律法规类/省级地方性法规 \\
-     --province 上海 \\
-     --effectiveness 省级地方性法规 \\
-     --append-jsonl data/d3_policies/_合并目录表/hits_raw.jsonl
+一键从 data 重算并写入 output/beijing_d3_hit_counts.csv：
 
-   对每种「效力位阶」子类各存一批页面，重复上述命令（换 --effectiveness 与目录）。
+   python -m src.d3_legal_hits rebuild-hit-csv
 
-2) 汇总为「各省各年三种政策类型的命中次数」（宽表）：
+若仍有旧结构「省/年份/」页面，可先迁移到「省/」下（会重写资源目录名并更新 HTML 内引用）：
 
-   python -m src.d3_legal_hits aggregate \\
-     --jsonl data/d3_policies/_合并目录表/hits_raw.jsonl \\
-     -o output/d3_province_year_hit_counts.csv
+   python -m src.d3_legal_hits migrate-data-layout
 
-3) 全自动 Playwright：需在 data/d3_scraper_config.json 中填写 selectors，
-   并实现 src/d3_site_plugin.py 中的 apply_search（见 d3_site_plugin_template.py）。
+其它子命令：parse-html（单目录追加 jsonl）、aggregate（从 jsonl 汇总）、playwright（需配置）。
 
 使用前请自行确认目标网站的 robots.txt 与用户协议，控制请求频率，避免对订阅库违规批量抓取。
 """
@@ -38,6 +31,7 @@ import csv
 import importlib
 import json
 import re
+import shutil
 from itertools import chain
 from collections import defaultdict
 from pathlib import Path
@@ -57,6 +51,16 @@ EFFECTIVENESS_TO_GROUP: dict[str, str] = {
 }
 
 # 每类包含的子检索（用于提示 / 文档）；实际检索在浏览器或插件中完成
+# data/d3_policies 下三大类文件夹名（与磁盘目录一致）
+POLICY_TYPE_DIRS: tuple[str, ...] = ("法律法规类", "部门规章类", "规范性文件类")
+
+# 大类文件夹 -> 解析时使用的效力位阶标签（用于命中解析与归类）
+FOLDER_TO_EFFECTIVENESS: dict[str, str] = {
+    "法律法规类": "省级地方性法规",
+    "部门规章类": "地方政府规章",
+    "规范性文件类": "地方规范性文件",
+}
+
 GROUP_SUBFILTERS: dict[str, tuple[str, ...]] = {
     "法律法规类": ("省级地方性法规", "自治条例和单行条例"),
     "部门规章类": ("地方政府规章",),
@@ -229,6 +233,173 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rewrite_html_asset_paths(html: str, old_stem: str, new_stem: str) -> str:
+    """另存为完整网页时，资源目录名为「主 html  stem + _files」；迁移时同步替换引用。"""
+    old_m = old_stem + "_files"
+    new_m = new_stem + "_files"
+    html = html.replace("./" + old_m + "/", "./" + new_m + "/")
+    html = html.replace("./" + old_m + "\\", "./" + new_m + "\\")
+    html = html.replace('"' + old_m + "/", '"' + new_m + "/")
+    html = html.replace("'" + old_m + "/", "'" + new_m + "/")
+    return html
+
+
+def migrate_data_layout(base: Path) -> int:
+    """将旧结构「类型/省/四位年/页面.html」迁到「类型/省/」，避免多份页面资源目录同名冲突。"""
+    n_moved = 0
+    for type_name in POLICY_TYPE_DIRS:
+        td = base / type_name
+        if not td.is_dir():
+            continue
+        for prov_dir in sorted(td.iterdir()):
+            if not prov_dir.is_dir() or prov_dir.name.startswith("_"):
+                continue
+            prov = prov_dir.name
+            for item in list(prov_dir.iterdir()):
+                if not item.is_dir():
+                    continue
+                if not re.fullmatch(r"\d{4}", item.name):
+                    continue
+                year = item.name
+                html_list = [
+                    p
+                    for p in chain(item.glob("*.html"), item.glob("*.htm"))
+                    if "drag_ele" not in p.name.lower()
+                ]
+                if not html_list:
+                    shutil.rmtree(item, ignore_errors=True)
+                    continue
+                seq = 0
+                for hf in sorted(html_list):
+                    old_stem = hf.stem
+                    old_files = item / f"{old_stem}_files"
+                    while True:
+                        new_stem = f"{year}_{prov}_{seq}"
+                        dest_html = prov_dir / f"{new_stem}.html"
+                        dest_files = prov_dir / f"{new_stem}_files"
+                        if not dest_html.exists() and not dest_files.exists():
+                            break
+                        seq += 1
+                    text = hf.read_text(encoding="utf-8", errors="replace")
+                    text = _rewrite_html_asset_paths(text, old_stem, new_stem)
+                    dest_html.write_text(text, encoding="utf-8")
+                    if old_files.is_dir():
+                        shutil.copytree(old_files, dest_files, dirs_exist_ok=True)
+                        shutil.rmtree(old_files, ignore_errors=True)
+                    hf.unlink(missing_ok=True)
+                    n_moved += 1
+                    seq += 1
+                shutil.rmtree(item, ignore_errors=True)
+    print(f"migrate-data-layout: 已迁移 {n_moved} 个 HTML 到省目录（并删除旧年份子文件夹）")
+    return 0
+
+
+def collect_html_paths_in_province(prov_dir: Path) -> list[Path]:
+    """省目录下顶层 html；若仍存在旧结构 省/年/*.html 也一并扫描。"""
+    out: list[Path] = []
+    for p in sorted(chain(prov_dir.glob("*.html"), prov_dir.glob("*.htm"))):
+        if "drag_ele" in p.name.lower():
+            continue
+        out.append(p)
+    for sub in sorted(prov_dir.iterdir()):
+        if not sub.is_dir():
+            continue
+        if not re.fullmatch(r"\d{4}", sub.name):
+            continue
+        for p in sorted(chain(sub.glob("*.html"), sub.glob("*.htm"))):
+            if "drag_ele" in p.name.lower():
+                continue
+            out.append(p)
+    return out
+
+
+def rebuild_hit_counts_csv(
+    base: Path,
+    out_csv: Path,
+    *,
+    item_selector: str | None = None,
+) -> int:
+    """扫描三类 × 各省下所有 html，按公布年份归入 2017–2023，汇总为省–年宽表。"""
+    rows: list[dict[str, Any]] = []
+    for type_name in POLICY_TYPE_DIRS:
+        eff = FOLDER_TO_EFFECTIVENESS[type_name]
+        td = base / type_name
+        if not td.is_dir():
+            continue
+        for prov_dir in sorted(td.iterdir()):
+            if not prov_dir.is_dir() or prov_dir.name.startswith("_"):
+                continue
+            province = prov_dir.name
+            for hf in collect_html_paths_in_province(prov_dir):
+                html = hf.read_text(encoding="utf-8", errors="replace")
+                rows.extend(
+                    parse_result_page(
+                        html,
+                        province=province,
+                        effectiveness_label=eff,
+                        item_selector=item_selector,
+                        fixed_year=None,
+                    )
+                )
+    sums: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {"法律法规类": 0, "部门规章类": 0, "规范性文件类": 0}
+    )
+    for r in rows:
+        key = (r["province"], int(r["year"]))
+        sums[key][r["group"]] += int(r["hits"])
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    keys = sorted(sums.keys(), key=lambda x: (x[0], x[1]))
+    with out_csv.open("w", newline="", encoding="utf-8-sig") as fp:
+        w = csv.writer(fp)
+        w.writerow(
+            [
+                "省份",
+                "年份",
+                "法律法规类_命中次数",
+                "部门规章类_命中次数",
+                "规范性文件类_命中次数",
+            ]
+        )
+        for prov, year in keys:
+            g = sums[(prov, year)]
+            w.writerow(
+                [
+                    prov,
+                    year,
+                    g["法律法规类"],
+                    g["部门规章类"],
+                    g["规范性文件类"],
+                ]
+            )
+    print(
+        f"rebuild-hit-csv: 解析 {len(rows)} 条法规级记录，"
+        f"输出 {len(keys)} 行省–年 -> {out_csv}"
+    )
+    return 0
+
+
+def cmd_migrate_data_layout(args: argparse.Namespace) -> int:
+    root = Path(args.data_root)
+    if not root.is_absolute():
+        root = Path(__file__).resolve().parents[1] / root
+    if not root.is_dir():
+        raise SystemExit(f"目录不存在: {root}")
+    return migrate_data_layout(root)
+
+
+def cmd_rebuild_hit_csv(args: argparse.Namespace) -> int:
+    root = Path(args.data_root)
+    if not root.is_absolute():
+        root = Path(__file__).resolve().parents[1] / root
+    if not root.is_dir():
+        raise SystemExit(f"目录不存在: {root}")
+    out = Path(args.output)
+    if not out.is_absolute():
+        out = Path(__file__).resolve().parents[1] / out
+    isel = (args.item_selector or "").strip() or None
+    return rebuild_hit_counts_csv(root, out, item_selector=isel)
+
+
 def _load_config(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -327,6 +498,42 @@ def main() -> int:
 
     p_list = sub.add_parser("list-filters", help="打印效力位阶与三大类对应关系")
     p_list.set_defaults(func=cmd_list_filters)
+
+    p_mig = sub.add_parser(
+        "migrate-data-layout",
+        help="将旧目录 类型/省/年份/ 下保存的网页迁到 类型/省/（重写资源路径）",
+    )
+    p_mig.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("data/d3_policies"),
+        help="D3 数据根目录，默认 data/d3_policies",
+    )
+    p_mig.set_defaults(func=cmd_migrate_data_layout)
+
+    p_reb = sub.add_parser(
+        "rebuild-hit-csv",
+        help="扫描 data 下三类×各省全部 html，按公布年汇总并覆盖输出 CSV",
+    )
+    p_reb.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("data/d3_policies"),
+        help="D3 数据根目录，默认 data/d3_policies",
+    )
+    p_reb.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("output/beijing_d3_hit_counts.csv"),
+        help="输出 CSV，默认 output/beijing_d3_hit_counts.csv",
+    )
+    p_reb.add_argument(
+        "--item-selector",
+        default="",
+        help="可选：每条结果 CSS 选择器",
+    )
+    p_reb.set_defaults(func=cmd_rebuild_hit_csv)
 
     p_parse = sub.add_parser("parse-html", help="从保存的结果页 HTML 解析并追加 jsonl")
     p_parse.add_argument("--html-dir", type=Path, required=True)
